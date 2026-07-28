@@ -47,3 +47,41 @@ def test_mock_client_forces_llm_fallback_to_heuristics_for_analysis():
     assert any(issue.get("type") == "Code Quality" for issue in result["issues"])
     # Ensure we logged the fallback path
     assert any("Falling back to heuristics" in entry.get("message", "") for entry in result["logs"])
+
+
+class DangerousFixClient:
+    """Fake offline client: valid analyzer JSON, but the "fix" introduces os.system()."""
+
+    def complete(self, system_prompt, user_prompt):
+        if "Return ONLY valid JSON" in system_prompt:
+            return (
+                '[{"type": "Reliability", "severity": "Low", '
+                '"msg": "minor cleanup suggested"}]'
+            )
+        return (
+            "def f(cmd):\n"
+            "    try:\n"
+            "        return os.system(cmd)\n"
+            "    except Exception as e:\n"
+            "        return None\n"
+        )
+
+
+def test_dangerous_fix_blocks_autofix_and_raises_risk():
+    # LLM output here is well-formed JSON + valid Python, so it passes the
+    # agent workflow's format checks. Only the risk assessor's dangerous-call
+    # guardrail should catch that os.system() wasn't in the original code.
+    agent = BugHoundAgent(client=DangerousFixClient())
+    code = (
+        "def f(cmd):\n"
+        "    try:\n"
+        "        return run(cmd)\n"
+        "    except:\n"
+        "        return None\n"
+    )
+    result = agent.run(code)
+
+    risk = result["risk"]
+    assert risk["should_autofix"] is False
+    assert risk["level"] != "low"
+    assert any("dangerous" in r.lower() for r in risk["reasons"])

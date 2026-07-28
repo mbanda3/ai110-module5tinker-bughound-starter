@@ -1,5 +1,10 @@
 from typing import Dict, List
 
+# Calls that shouldn't appear in a fix unless they were already in the
+# original code — introducing one of these is at least as risky as a
+# high-severity issue.
+_DANGEROUS_PATTERNS = ("eval(", "exec(", "os.system(", "subprocess.call(", "pickle.loads(")
+
 
 def assess_risk(
     original_code: str,
@@ -61,6 +66,17 @@ def assess_risk(
         # This is usually good, but still risky.
         score -= 5
         reasons.append("Bare except was modified, verify correctness.")
+
+    introduced_dangerous = [
+        p for p in _DANGEROUS_PATTERNS
+        if p in fixed_code and p not in original_code
+    ]
+    if introduced_dangerous:
+        score -= 35
+        reasons.append(
+            "Fix introduces potentially dangerous call(s) not present in the "
+            f"original: {', '.join(introduced_dangerous)}."
+        )
 
     # ----------------------------
     # Clamp score

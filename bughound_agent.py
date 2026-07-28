@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import re
@@ -86,7 +87,11 @@ class BugHoundAgent:
         issues = self._parse_json_array_of_issues(raw)
 
         if issues is None:
-            self._log("ANALYZE", "LLM output was not parseable JSON. Falling back to heuristics.")
+            self._log(
+                "ANALYZE",
+                "LLM output was not parseable JSON, or contained malformed issues "
+                "(missing type/msg, or severity not in Low/Medium/High). Falling back to heuristics.",
+            )
             return self._heuristic_analyze(code_snippet)
 
         return issues
@@ -117,7 +122,14 @@ class BugHoundAgent:
         cleaned = self._strip_code_fences(raw).strip()
 
         if not cleaned:
-            self._log("ACT", "LLM returned empty output. Falling back to heuristic fixer.")
+            self._log("ACT", "LLM returned empty output. Falling back to heuristics.")
+            return self._heuristic_fix(code_snippet, issues)
+
+        if not self._is_valid_python(cleaned):
+            self._log(
+                "ACT",
+                "LLM fix is not syntactically valid Python. Falling back to heuristics.",
+            )
             return self._heuristic_fix(code_snippet, issues)
 
         return cleaned
@@ -173,6 +185,10 @@ class BugHoundAgent:
     # ----------------------------
     # Parsing + utilities
     # ----------------------------
+    # Severities the risk assessor actually knows how to score. Anything else
+    # is treated as malformed LLM output rather than silently scored as zero risk.
+    _VALID_SEVERITIES = {"low", "medium", "high"}
+
     def _parse_json_array_of_issues(self, text: str) -> Optional[List[Dict[str, str]]]:
         text = text.strip()
         parsed = self._try_json_loads(text)
@@ -187,18 +203,22 @@ class BugHoundAgent:
 
         return None
 
-    def _normalize_issues(self, arr: List[Any]) -> List[Dict[str, str]]:
+    def _normalize_issues(self, arr: List[Any]) -> Optional[List[Dict[str, str]]]:
         issues: List[Dict[str, str]] = []
         for item in arr:
             if not isinstance(item, dict):
                 continue
-            issues.append(
-                {
-                    "type": str(item.get("type", "Issue")),
-                    "severity": str(item.get("severity", "Unknown")),
-                    "msg": str(item.get("msg", "")).strip(),
-                }
-            )
+
+            issue_type = str(item.get("type", "")).strip()
+            severity = str(item.get("severity", "")).strip()
+            msg = str(item.get("msg", "")).strip()
+
+            if not issue_type or not msg or severity.lower() not in self._VALID_SEVERITIES:
+                # Reject the whole batch rather than silently keeping a
+                # malformed issue the risk assessor wouldn't score correctly.
+                return None
+
+            issues.append({"type": issue_type, "severity": severity, "msg": msg})
         return issues
 
     def _try_json_loads(self, s: str) -> Any:
@@ -227,6 +247,13 @@ class BugHoundAgent:
         if match:
             return match.group(1)
         return text
+
+    def _is_valid_python(self, code: str) -> bool:
+        try:
+            ast.parse(code)
+            return True
+        except SyntaxError:
+            return False
 
     def _can_call_llm(self) -> bool:
         return self.client is not None and hasattr(self.client, "complete")
